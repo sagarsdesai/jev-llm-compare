@@ -392,18 +392,38 @@ Sidecar `.meta.json` per file:
 
 ---
 
-## Progress as of 2026-10-02
+## Progress as of 2026-10-02 (ALL COMPLETE)
 
-| Run | Status | Records | Errors |
-|---|---|---|---|
-| Net floor | **DONE** | — | — |
-| Concurrency sweep (OFF) | **DONE** | 30/level x7 | 0 |
-| Run 1: Verdict OFF (3 folds) | **DONE** | 2000 / 2000 | 0 |
-| Run 2: Signals OFF (3 folds) | **DONE** | 2000 / 2000 | 0 |
-| Run 3: Verdict ON (3 folds) | **DONE** | 2000 / 2000 | 0 |
-| Run 4: Signals ON (3 folds) | **In progress** | ~1500 / 2000 | 0 |
+| Run | Status | Records | Errors | Wall-clock (2k emails) |
+|---|---|---|---|---|
+| Net floor | **DONE** | — | — | — |
+| Concurrency sweep (OFF) | **DONE** | 30/level x7 | 0 | — |
+| Run 1: Verdict OFF (3 folds) | **DONE** | 2000 / 2000 | 0 | 28s |
+| Run 2: Signals OFF (3 folds) | **DONE** | 2000 / 2000 | 0 | 419s (7 min) |
+| Run 3: Verdict ON (3 folds) | **DONE** | 2000 / 2000 | 0 | 986s (16 min) |
+| Run 4: Signals ON (3 folds) | **DONE** | 2000 / 2000 | 0 | 3691s (61 min) |
 
-Next: when run 4 completes, run `analyze.py --folds 3` for all 4 experiments.
+All 8000 emails processed, 0 API errors, 0 format errors.
+
+## Final results summary
+
+| Model | Task | AUROC | Accuracy | Recall | FPR | ECE | Wall-clock 2k |
+|---|---|---|---|---|---|---|---|
+| Jev (published) | Verdict | 0.689 | 62.6% | 43.2% | 18.0% | 0.154 | ~14 min |
+| Haiku 4.5 (published) | Verdict | 0.837 | 81.3% | 76.4% | 13.8% | 0.097 | ~67 min |
+| Nemotron OFF | Verdict | 0.712 | 64.3% | 30.2% | 1.6% | 0.286 | 28s |
+| Nemotron ON | Verdict | **0.899** | 77.5% | 58.5% | 3.5% | 0.226 | 986s |
+| Jev (published) | Signals | 0.982 | 95.0% | 97.0% | 7.0% | — | ~14 min |
+| Haiku 4.5 (published) | Signals | 0.991 | 93.2% | 91.8% | 5.4% | — | ~67 min |
+| Nemotron OFF | Signals | 0.970 | 76.8% | 54.3% | 0.5% | — | 419s |
+| Nemotron ON | Signals | 0.929 | 73.0% | 48.5% | 2.6% | — | 3691s |
+
+Key findings:
+- Thinking ON verdict AUROC **0.899** beats Haiku 4.5 (0.837), best of the four models tested
+- Thinking ON costs 8x latency and 61x output tokens vs OFF
+- Signals decomposition is highly effective: AUROC 0.712 → 0.970 (thinking OFF), within 0.012 of Jev
+- Thinking ON **hurts** signals: 0.970 → 0.929 (reasoning adds noise to URL/domain feature checks)
+- Local H100: verdict OFF 2k emails in 28s vs ~18 hours estimated on the remote shared API
 
 ---
 
