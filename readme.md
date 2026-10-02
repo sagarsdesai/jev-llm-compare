@@ -40,7 +40,7 @@ This extension adds Nemotron as a second LLM baseline to answer two questions:
 | AUROC | 0.689 | 0.837 | ? | ? |
 | ECE | 0.154 | 0.097 | ? | ? |
 | Latency p50 (sequential) | 239 ms | 687 ms | ? | ? |
-| Cost / 1k emails | $0.038 | $0.462 | ? | ? |
+| Cost / 1k emails | $0.038 | $0.462 | $0 (local) | $0 (local) |
 
 Signals comparison (half-B evaluation, same split as published):
 
@@ -54,11 +54,18 @@ Signals comparison (half-B evaluation, same split as published):
 
 ## Machine setup (start from scratch)
 
+### Hardware
+
+- **GPU**: H100 80GB HBM3 (on-machine, dedicated)
+- **OS**: Linux 6.11.0 (nvidia kernel)
+- All experiments run against a **local NIM container** on the H100 — no remote API calls, no rate
+  limits, no shared bandwidth.
+
 ### Prerequisites
 
 - Python 3.11+, `uv` package manager (`pip install uv` or `curl -LsSf https://astral.sh/uv/install.sh | sh`)
-- Internet access to `https://integrate.api.nvidia.com`
-- No GPU required (NIM is a remote API)
+- Docker with NVIDIA Container Toolkit (`nvidia-docker2`)
+- An NGC API key (from `build.nvidia.com`) — needed only once to pull the NIM image
 
 ### Clone and install
 
@@ -69,88 +76,68 @@ uv sync
 uv add openai  # needed for NIM calls
 ```
 
-### Apply script fixes (critical — not yet merged upstream)
+### Deploy NIM locally on H100
 
-The upstream repo is missing several bug fixes and new flags required for Nemotron runs.
-Apply all of them before running anything:
+This is the critical step. All experiments must hit the local NIM, not the remote shared API.
 
-**Fix 1 — `bench/common.py`: `done_ids()` must exclude format errors**
+**Step 1 — Authenticate to NVIDIA's container registry (once per machine):**
 
-```python
-# bench/common.py line ~79
-# BEFORE:
-return {r["id"] for r in read_jsonl(path) if r.get("ok")}
-# AFTER:
-return {r["id"] for r in read_jsonl(path) if r.get("ok") and "format_error" not in r}
+```bash
+docker login nvcr.io --username '$oauthtoken' --password <your-ngc-api-key>
 ```
 
-**Fix 2 — `run_llm.py`: guard `response_format`, pin temperature, add `--suffix`**
+**Step 2 — Pull and start the NIM container:**
 
-In `build_body()`, replace the unconditional `response_format` line:
+```bash
+export LOCAL_NIM_CACHE=~/.cache/nim
+mkdir -p "$LOCAL_NIM_CACHE"
 
-```python
-# In the openai branch of build_body(), replace:
-#   "response_format": {"type": "json_object"},
-# with:
-if not env("LLM_NO_RESPONSE_FORMAT"):
-    body["response_format"] = {"type": "json_object"}
-
-# After body.update(extra), add:
-body["temperature"] = 0  # prevent LLM_EXTRA_BODY from overriding temperature
+docker run -d \
+    --name nim-nemotron \
+    --gpus all \
+    --shm-size=16GB \
+    -e NGC_API_KEY=<your-ngc-api-key> \
+    -v "$LOCAL_NIM_CACHE:/opt/nim/.cache" \
+    -p 8000:8000 \
+    nvcr.io/nim/nvidia/nemotron-3.5-lightning-30b-a3b:latest
 ```
 
-In `main()`, add after the existing `--concurrency` argument:
+**Step 3 — Wait for NIM to be healthy (~2-3 minutes):**
 
-```python
-parser.add_argument("--suffix", type=str, default="", help="tag appended to output filename")
+```bash
+until curl -s http://localhost:8000/v1/models | grep -q '"id"'; do sleep 5; done
+curl -s http://localhost:8000/v1/models
 ```
 
-Update the output path:
+Expected output: `{"object":"list","data":[{"id":"nvidia/nemotron-3.5-lightning",...}]}`
 
-```python
-suffix_part = f"_{args.suffix}" if args.suffix else ""
-out = RAW_DIR / f"llm_{model}{suffix_part}_pass{args.pass_no}.jsonl"
+> **Important**: The NIM reports its model ID as `nvidia/nemotron-3.5-lightning` (not the image tag
+> `nemotron-3.5-lightning-30b-a3b`). Use this exact string in `.env` as `LLM_MODEL`.
+
+**Step 4 — Check GPU is being used:**
+
+```bash
+nvidia-smi
+# Should show the nim-nemotron process consuming GPU memory
 ```
 
-**Fix 3 — `run_llm_signals.py`: add `--concurrency`, `--suffix`, fix `LLM_NO_RESPONSE_FORMAT`,
-fix temperature, fix consecutive_failures counter, add threading**
+**Check NIM logs if it fails to start:**
 
-Add imports at the top:
-
-```python
-import threading
-from concurrent.futures import ThreadPoolExecutor
+```bash
+docker logs nim-nemotron --tail 50
 ```
 
-In `build_body()`:
+**Restart NIM after machine reboot:**
 
-```python
-# Same as run_llm.py: replace unconditional response_format with:
-if not env("LLM_NO_RESPONSE_FORMAT"):
-    body["response_format"] = {"type": "json_object"}
-# And after body.update(extra):
-body["temperature"] = 0
+```bash
+# NIM container does NOT auto-restart — re-run Step 2 after any reboot
+# Model weights are cached in ~/.cache/nim so the second pull is instant
+docker run -d --name nim-nemotron --gpus all --shm-size=16GB \
+    -e NGC_API_KEY=<your-ngc-api-key> \
+    -v "$HOME/.cache/nim:/opt/nim/.cache" \
+    -p 8000:8000 \
+    nvcr.io/nim/nvidia/nemotron-3.5-lightning-30b-a3b:latest
 ```
-
-In `main()`, add arguments:
-
-```python
-parser.add_argument("--concurrency", type=int, default=1)
-parser.add_argument("--suffix", type=str, default="")
-```
-
-Update the output path:
-
-```python
-suffix_part = f"_{args.suffix}" if args.suffix else ""
-out = RAW_DIR / f"llm_{model}_signals{suffix_part}_pass{args.pass_no}.jsonl"
-```
-
-Replace the sequential loop with a threaded worker pattern mirroring `run_llm.py`
-(use `threading.Lock()`, `threading.Event()`, `ThreadPoolExecutor`).
-The key bug: `consecutive_failures` was not incremented in the parse-exception branch — fix that too.
-
-> All three fixes are already applied in the code on the current machine at `/home/ubuntu/jev-phishing-bench`.
 
 ### Download benchmark data
 
@@ -160,24 +147,28 @@ uv run prepare_data.py
 
 Verify: `wc -l data/emails.jsonl` should print 2000.
 
-### Create `.env`
+### Create `.env` (local NIM — no API key needed for inference)
 
 ```
 TYPESAFE_API_KEY=
 TYPESAFE_BASE_URL=https://api.typesafe.ai
 TYPESAFE_MODEL=jev-latest
 
+# Local NIM on H100
 LLM_PROVIDER=openai
-LLM_BASE_URL=https://integrate.api.nvidia.com/v1
-LLM_API_KEY=<your-nvidia-nim-api-key>
-LLM_MODEL=nvidia/nemotron-3.5-lightning-30b-a3b
-LLM_PRICE_IN=0.20
-LLM_PRICE_OUT=0.65
+LLM_BASE_URL=http://localhost:8000/v1
+LLM_API_KEY=local
+LLM_MODEL=nvidia/nemotron-3.5-lightning
+LLM_PRICE_IN=0.0
+LLM_PRICE_OUT=0.0
 LLM_RPM=0
 LLM_EXTRA_BODY={"chat_template_kwargs":{"enable_thinking":true},"reasoning_budget":16384}
 LLM_NO_RESPONSE_FORMAT=1
-LLM_GRID_MODEL=nvidia/nemotron-3.5-lightning-30b-a3b
+LLM_GRID_MODEL=nvidia/nemotron-3.5-lightning
 ```
+
+> **Never** commit `.env` to git. It is gitignored. The NGC API key used to pull the image
+> should not appear in any script or commit.
 
 ### Create results directory
 
@@ -187,71 +178,194 @@ mkdir -p results/raw/llm_nvidia
 
 ---
 
-## Running the 4 experiments
+## Apply script fixes (critical — not yet merged upstream)
 
-### Why --concurrency 8 is required
+The upstream repo is missing several bug fixes and new flags required for Nemotron runs.
+Apply all of them before running anything:
 
-The NIM endpoint has a **bimodal latency distribution**: most requests return in ~1s but a tail of
-requests takes 100+ seconds (NIM backend queueing). Running sequentially means one slow request
-blocks 8+ fast ones. With `--concurrency 8`, slow requests don't stall the queue and total wall-clock
-time drops from ~18 hours to ~1-2 hours for thinking-OFF runs. Per-email `latency_s` stored in JSONL
-is unaffected by concurrency — it measures each request independently.
+**Fix 1 — `bench/common.py`: `done_ids()` must exclude format errors and add `fold_emails()`**
 
-### The 4 run commands (chain in sequence)
+```python
+# bench/common.py line ~79
+# BEFORE:
+return {r["id"] for r in read_jsonl(path) if r.get("ok")}
+# AFTER:
+return {r["id"] for r in read_jsonl(path) if r.get("ok") and "format_error" not in r}
+
+# Add new function:
+def fold_emails(emails: list, fold: int, num_folds: int) -> list:
+    """Return the fold-th (1-indexed) non-overlapping slice."""
+    size = len(emails)
+    start = (fold - 1) * size // num_folds
+    end = fold * size // num_folds
+    return emails[start:end]
+```
+
+**Fix 2 — `run_llm.py`: guard `response_format`, pin temperature, add fold/warmup/httpx flags**
+
+- Add `--suffix`, `--fold K`, `--num-folds N`, `--warmup W` arguments
+- Add `make_client(concurrency)` using `httpx.Limits` with HTTP/2
+- Guard `response_format` with `LLM_NO_RESPONSE_FORMAT` env var
+- Pin `temperature=0` after `body.update(extra)` to prevent override
+- Implement warmup: fire W real requests before `wall_clock_start` (not recorded)
+- Write sidecar `.meta.json` at end with throughput stats
+
+**Fix 3 — `run_llm_signals.py`: same fold/warmup/httpx/sidecar changes as `run_llm.py`**
+
+> All fixes are already applied in `/home/ubuntu/jev-phishing-bench` (current machine).
+> The new scripts `run_concurrency_sweep.py` and updated `net_floor.py` are also in place.
+
+---
+
+## Fair benchmark protocol
+
+### Why local NIM changes everything
+
+The previous approach hit `integrate.api.nvidia.com` (shared remote NIM):
+- Bimodal latency: p50 ~0.88s but p95 ~84s from backend queueing
+- Rate limits at concurrency ≥ 8: 11/40 errors at c=8, 16/40 at c=16
+- Sequential runs averaged 32s/email — effectively 18 hours for 2000 emails
+- H100 on-machine was sitting **completely idle**
+
+With local NIM on H100:
+- No rate limits, no shared bandwidth, no tail-latency spikes
+- GPU is saturated by the benchmark workload directly
+- Throughput limited only by model compute, not network
+- Cost = $0 (electricity only)
+
+### Three non-overlapping folds for statistical validity
+
+Each experiment runs 3 non-overlapping folds of ~667 emails each (total = 2000). This gives:
+- 3 independent accuracy estimates per experiment
+- Mean ± std across folds (not just a single point estimate)
+- Zero email overlap between folds (verified by seeded order index)
+
+### Concurrency sweep to find GPU saturation
+
+Before the main runs, sweep concurrency levels to find where throughput plateaus:
+
+```bash
+# Find where doubling concurrency gives <20% more throughput
+uv run run_concurrency_sweep.py
+```
+
+Use the recommended concurrency for all main benchmark runs.
+
+### Warmup requests
+
+Fire a small number of real requests before timing starts to:
+- Establish HTTP/2 keep-alive connections
+- Prime the NIM JIT compilation cache on first load
+
+Warmup requests use real API calls but results are discarded and not recorded.
+
+---
+
+## Running the full protocol (all 4 experiments × 3 folds)
+
+### Step 1: Network floor (run once, ~2 min)
+
+```bash
+cd /home/ubuntu/jev-phishing-bench
+uv run net_floor.py --n 50 --concurrency 32
+```
+
+### Step 2: Concurrency sweep — thinking OFF (run once, ~5-10 min)
+
+```bash
+LLM_EXTRA_BODY='{"chat_template_kwargs":{"enable_thinking":false}}' \
+LLM_NO_RESPONSE_FORMAT='' \
+uv run run_concurrency_sweep.py --suffix off
+```
+
+Check recommended concurrency in the output table. For local NIM, expect saturation at 16-64 depending
+on GPU utilization. Use the recommended value (call it `C_OFF`) for runs 1 and 2.
+
+### Step 3: Run 1 — Verdict, thinking OFF (3 folds)
+
+```bash
+for FOLD in 1 2 3; do
+  LLM_EXTRA_BODY='{"chat_template_kwargs":{"enable_thinking":false}}' \
+  LLM_NO_RESPONSE_FORMAT='' \
+  uv run run_llm.py --fold $FOLD --num-folds 3 --concurrency $C_OFF --warmup 3
+done
+```
+
+### Step 4: Run 2 — Signals, thinking OFF (3 folds)
+
+```bash
+for FOLD in 1 2 3; do
+  LLM_EXTRA_BODY='{"chat_template_kwargs":{"enable_thinking":false}}' \
+  LLM_NO_RESPONSE_FORMAT='' \
+  uv run run_llm_signals.py --fold $FOLD --num-folds 3 --concurrency $C_OFF --warmup 3
+done
+```
+
+### Step 5: Concurrency sweep — thinking ON (optional, may differ from OFF)
+
+```bash
+uv run run_concurrency_sweep.py --suffix on
+# Uses .env defaults: enable_thinking=true, LLM_NO_RESPONSE_FORMAT=1
+```
+
+Use recommended concurrency `C_ON` for runs 3 and 4 (thinking is slower, so saturation point is lower).
+
+### Step 6: Run 3 — Verdict, thinking ON (3 folds)
+
+```bash
+for FOLD in 1 2 3; do
+  uv run run_llm.py --suffix thinking --fold $FOLD --num-folds 3 --concurrency $C_ON --warmup 2
+done
+```
+
+### Step 7: Run 4 — Signals, thinking ON (3 folds)
+
+```bash
+for FOLD in 1 2 3; do
+  uv run run_llm_signals.py --suffix thinking --fold $FOLD --num-folds 3 --concurrency $C_ON --warmup 2
+done
+```
+
+### Step 8: Analyze
+
+```bash
+# Thinking OFF
+LLM_MODEL=nvidia/nemotron-3.5-lightning uv run analyze.py --folds 3
+
+# Thinking ON
+LLM_MODEL=nvidia/nemotron-3.5-lightning uv run analyze.py --llm-suffix thinking --folds 3
+```
+
+### One-shot command (chain all 4 runs sequentially at C=32 placeholder — update C after sweep)
 
 ```bash
 cd /home/ubuntu/jev-phishing-bench
 
-# RUN 1: Verdict, thinking OFF
-LLM_EXTRA_BODY='{"chat_template_kwargs":{"enable_thinking":false}}' \
-LLM_NO_RESPONSE_FORMAT='' \
-uv run run_llm.py --concurrency 8
+C_OFF=32   # update after concurrency sweep
+C_ON=16    # update after sweep with thinking ON
 
-# RUN 2: Signals (5 questions), thinking OFF
-LLM_EXTRA_BODY='{"chat_template_kwargs":{"enable_thinking":false}}' \
-LLM_NO_RESPONSE_FORMAT='' \
-uv run run_llm_signals.py --concurrency 8
-
-# RUN 3: Verdict, thinking ON (.env already has enable_thinking:true and LLM_NO_RESPONSE_FORMAT=1)
-uv run run_llm.py --suffix thinking --concurrency 8
-
-# RUN 4: Signals, thinking ON
-uv run run_llm_signals.py --suffix thinking --concurrency 8
-```
-
-### Single background command (recommended)
-
-```bash
-cd /home/ubuntu/jev-phishing-bench && \
-echo "=== RUN 1: Verdict thinking OFF ===" && \
-LLM_EXTRA_BODY='{"chat_template_kwargs":{"enable_thinking":false}}' LLM_NO_RESPONSE_FORMAT='' uv run run_llm.py --concurrency 8 && \
-echo "=== RUN 2: Signals thinking OFF ===" && \
-LLM_EXTRA_BODY='{"chat_template_kwargs":{"enable_thinking":false}}' LLM_NO_RESPONSE_FORMAT='' uv run run_llm_signals.py --concurrency 8 && \
-echo "=== RUN 3: Verdict thinking ON ===" && \
-uv run run_llm.py --suffix thinking --concurrency 8 && \
-echo "=== RUN 4: Signals thinking ON ===" && \
-uv run run_llm_signals.py --suffix thinking --concurrency 8 && \
+for FOLD in 1 2 3; do
+  echo "=== RUN 1 fold $FOLD ===" && \
+  LLM_EXTRA_BODY='{"chat_template_kwargs":{"enable_thinking":false}}' LLM_NO_RESPONSE_FORMAT='' \
+  uv run run_llm.py --fold $FOLD --num-folds 3 --concurrency $C_OFF --warmup 3
+done && \
+for FOLD in 1 2 3; do
+  echo "=== RUN 2 fold $FOLD ===" && \
+  LLM_EXTRA_BODY='{"chat_template_kwargs":{"enable_thinking":false}}' LLM_NO_RESPONSE_FORMAT='' \
+  uv run run_llm_signals.py --fold $FOLD --num-folds 3 --concurrency $C_OFF --warmup 3
+done && \
+for FOLD in 1 2 3; do
+  echo "=== RUN 3 fold $FOLD ===" && \
+  uv run run_llm.py --suffix thinking --fold $FOLD --num-folds 3 --concurrency $C_ON --warmup 2
+done && \
+for FOLD in 1 2 3; do
+  echo "=== RUN 4 fold $FOLD ===" && \
+  uv run run_llm_signals.py --suffix thinking --fold $FOLD --num-folds 3 --concurrency $C_ON --warmup 2
+done && \
 echo "=== ALL DONE ==="
 ```
 
 Scripts are resumable. If interrupted, re-run the same command — already-completed emails are skipped.
-
-### Time estimates (at concurrency 8)
-
-| Run | Per-email latency | 2000 emails wall-clock |
-|---|---|---|
-| Verdict thinking OFF | ~1-3s p50 (tail: 100s) | ~30-60 min |
-| Signals thinking OFF | ~1-3s p50 | ~30-60 min |
-| Verdict thinking ON | ~40-70s | ~2.5-4h |
-| Signals thinking ON | ~40-70s | ~2.5-4h |
-
-### Checking progress
-
-```bash
-wc -l results/raw/llm_nvidia/*.jsonl
-```
-
-Each line = one email processed. Need 2000 in each file for a complete run.
 
 ---
 
@@ -271,16 +385,11 @@ LLM_EXTRA_BODY='{"chat_template_kwargs":{"enable_thinking":false}}'
 When thinking is enabled the NIM endpoint errors if `response_format` is sent. The `.env` already sets
 `LLM_NO_RESPONSE_FORMAT=1`. For thinking-OFF runs, clear it inline (`LLM_NO_RESPONSE_FORMAT=''`).
 
-### Contaminated data backup
+### Model ID reported by local NIM
 
-An early run used `LLM_EXTRA_BODY={}` to try to disable thinking — this does not work and collected
-90 emails with thinking implicitly ON labeled as "thinking OFF". These are preserved as:
-
-```
-results/raw/llm_nvidia/nemotron-3.5-lightning-30b-a3b_pass1.contaminated_backup.jsonl
-```
-
-The main `_pass1.jsonl` was cleared and restarted with the correct flag.
+The image tag is `nemotron-3.5-lightning-30b-a3b` but the NIM reports its model as
+`nvidia/nemotron-3.5-lightning`. Use the latter in `.env` as `LLM_MODEL` — it is what the API
+accepts and what gets stored in JSONL output.
 
 ---
 
@@ -290,10 +399,13 @@ All raw output in `results/raw/llm_nvidia/`:
 
 | File | Run |
 |---|---|
-| `nemotron-3.5-lightning-30b-a3b_pass1.jsonl` | Run 1: Verdict, thinking OFF |
-| `nemotron-3.5-lightning-30b-a3b_signals_pass1.jsonl` | Run 2: Signals, thinking OFF |
-| `nemotron-3.5-lightning-30b-a3b_thinking_pass1.jsonl` | Run 3: Verdict, thinking ON |
-| `nemotron-3.5-lightning-30b-a3b_thinking_signals_pass1.jsonl` | Run 4: Signals, thinking ON |
+| `llm_nvidia/nemotron-3.5-lightning_fold1_pass1.jsonl` | Run 1 fold 1: Verdict, thinking OFF |
+| `llm_nvidia/nemotron-3.5-lightning_fold2_pass1.jsonl` | Run 1 fold 2: Verdict, thinking OFF |
+| `llm_nvidia/nemotron-3.5-lightning_fold3_pass1.jsonl` | Run 1 fold 3: Verdict, thinking OFF |
+| `llm_nvidia/nemotron-3.5-lightning_signals_fold1_pass1.jsonl` | Run 2 fold 1: Signals, thinking OFF |
+| ... (same pattern) | ... |
+| `llm_nvidia/nemotron-3.5-lightning_thinking_fold1_pass1.jsonl` | Run 3 fold 1: Verdict, thinking ON |
+| `llm_nvidia/nemotron-3.5-lightning_thinking_signals_fold1_pass1.jsonl` | Run 4 fold 1: Signals, ON |
 
 Each JSONL line:
 
@@ -304,29 +416,43 @@ Each JSONL line:
   "ok": true,
   "click": 1,
   "phishing_probability": 0.95,
-  "latency_s": 2.91,
+  "latency_s": 0.31,
   "usage": {"input_tokens": 349, "output_tokens": 17},
-  "model": "nvidia/nemotron-3.5-lightning-30b-a3b"
+  "model": "nvidia/nemotron-3.5-lightning",
+  "concurrency": 32,
+  "fold": 1,
+  "num_folds": 3
 }
 ```
 
-Signals runs also include `sig_domain_mismatch`, `sig_free_hosting`, `sig_lure`, `sig_urgency`,
-`sig_generic_sender` (each 0-1).
+Each JSONL file has a sidecar `.meta.json` with wall-clock throughput:
+
+```json
+{
+  "wall_clock_s": 42.1,
+  "emails_per_sec": 15.85,
+  "tokens_out_per_sec": 1240.3,
+  "concurrency": 32,
+  "warmup": 3,
+  "fold": 1,
+  "num_folds": 3
+}
+```
 
 ---
 
 ## Running analysis
 
-After all 4 runs reach 2000 lines:
+After all runs complete:
 
 ```bash
 cd /home/ubuntu/jev-phishing-bench
 
-# Thinking OFF
-LLM_MODEL=nvidia/nemotron-3.5-lightning-30b-a3b uv run analyze.py
+# Thinking OFF (merges fold1+fold2+fold3, computes mean ± std)
+LLM_MODEL=nvidia/nemotron-3.5-lightning uv run analyze.py --folds 3
 
 # Thinking ON
-LLM_MODEL=nvidia/nemotron-3.5-lightning-30b-a3b uv run analyze.py --llm-suffix thinking
+LLM_MODEL=nvidia/nemotron-3.5-lightning uv run analyze.py --llm-suffix thinking --folds 3
 ```
 
 Outputs: `results/metrics.json`, `results/report.md`.
@@ -337,32 +463,53 @@ Outputs: `results/metrics.json`, `results/report.md`.
 
 | Run | Status | Records done |
 |---|---|---|
-| Run 1: Verdict thinking OFF | In progress | ~780 / 2000 |
-| Run 2: Signals thinking OFF | Not started | 0 / 2000 |
-| Run 3: Verdict thinking ON | Not started | 0 / 2000 |
-| Run 4: Signals thinking ON | Not started | 0 / 2000 |
+| Setup: local NIM on H100 | **DONE** | Container healthy at localhost:8000 |
+| Step 1: Net floor | Not started | — |
+| Step 2: Concurrency sweep (thinking OFF) | Not started | — |
+| Run 1: Verdict thinking OFF (3 folds) | Not started | 0 / 2000 |
+| Run 2: Signals thinking OFF (3 folds) | Not started | 0 / 2000 |
+| Step 5: Concurrency sweep (thinking ON) | Not started | — |
+| Run 3: Verdict thinking ON (3 folds) | Not started | 0 / 2000 |
+| Run 4: Signals thinking ON (3 folds) | Not started | 0 / 2000 |
 
-Currently running on `/home/ubuntu/jev-phishing-bench` with concurrency 8 in a background process.
+**All previous runs against the remote API were cleared.** Starting fresh on local NIM.
 
-### What we learned today
+### What changed from the previous approach
 
-- **NIM latency is bimodal**: p50 ~0.88s but p95 ~84s. A tail of requests takes 100+ seconds due
-  to NIM backend queueing. Sequential runs are therefore ~32s/email average despite p50 being <1s.
-  Always use `--concurrency 8`.
-- **Three script bugs were present in the upstream repo** and are now fixed locally (see setup section).
-- **`--suffix` and `--concurrency` flags for `run_llm_signals.py`** did not exist upstream — added locally.
+| Before | After |
+|---|---|
+| Remote shared API (`integrate.api.nvidia.com`) | Local NIM on H100 80GB |
+| Bimodal latency (p50 0.88s, p95 84s) | GPU-bound latency only |
+| Rate limits at concurrency ≥ 8 | No rate limits |
+| Sequential ~32s/email average | Expected <1s/email at saturation |
+| H100 completely idle | H100 fully utilized |
+| Single pass, no variance estimate | 3 folds, mean ± std |
+| No warmup | Warmup + HTTP/2 connection pool |
+| No GPU saturation measurement | Concurrency sweep before main runs |
 
 ---
 
 ## Quick reference
 
 ```bash
+# Check NIM is running
+curl -s http://localhost:8000/v1/models | python3 -m json.tool
+
+# Check GPU utilization during runs
+nvidia-smi dmon -d 2
+
 # Check progress
 wc -l results/raw/llm_nvidia/*.jsonl
 
-# Tail live output
-tail -f results/raw/llm_nvidia/nemotron-3.5-lightning-30b-a3b_pass1.jsonl | \
-  python3 -c "import sys,json; [print(r['id'], r.get('phishing_probability'), f\"{r.get('latency_s',0):.2f}s\") for r in map(json.loads, sys.stdin)]"
+# Restart NIM after reboot (weights cached, fast)
+docker run -d --name nim-nemotron --gpus all --shm-size=16GB \
+    -e NGC_API_KEY=<your-ngc-api-key> \
+    -v "$HOME/.cache/nim:/opt/nim/.cache" \
+    -p 8000:8000 \
+    nvcr.io/nim/nvidia/nemotron-3.5-lightning-30b-a3b:latest
+
+# Stop NIM
+docker stop nim-nemotron
 
 # Dry-run test (no output written)
 LLM_EXTRA_BODY='{"chat_template_kwargs":{"enable_thinking":false}}' \
