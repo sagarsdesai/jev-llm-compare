@@ -46,6 +46,27 @@ Same dataset used for the published Jev and Haiku baselines.
 
 ## Final results
 
+### Headline table (format of the original benchmark)
+
+Verdict task, 2000 emails. Jev and Haiku columns are the published numbers; Nemotron columns are
+pooled across 3 folds on a local H100.
+
+| Metric | Jev | Haiku 4.5 | Nemotron OFF | Nemotron ON |
+|---|---|---|---|---|
+| Accuracy | 62.6% | 81.3% | 64.3% | 77.5% |
+| Recall on phishing | 43.2% | 76.4% | 30.2% | 58.5% |
+| False positive rate | 18.0% | 13.8% | 1.6% | 3.5% |
+| AUROC | 0.689 | 0.837 | 0.712 | 0.899 |
+| ECE | 0.154 | 0.097 | 0.286 | 0.226 |
+| Latency p50 | 239 ms | 687 ms | 419 ms | 3574 ms |
+| Latency p95 | 331 ms | 980 ms | 491 ms | 6575 ms |
+| Wall-clock, 2k emails | ~14 min | ~67 min | 28 s | 986 s |
+| Cost per 1k emails | $0.038 | $0.462 | $0.00 | $0.00 |
+
+Jev and Haiku latencies (p50, p95) were measured over the network from France; Nemotron was measured
+against `localhost`. Nemotron p95 is computed from the raw per-request latencies in the results
+tarball. Jev/Haiku p95 come from `results/report.md` in the original repo, which publishes no p90.
+
 ### Verdict task (pooled across 3 folds)
 
 | Model | AUROC | Accuracy | Recall | FPR | ECE | Lat p50 | Out tok/req | Wall-clock 2k | Cost/1k |
